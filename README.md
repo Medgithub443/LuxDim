@@ -2,7 +2,15 @@
 
 A lightweight and high-performance utility for Windows to control monitor brightness directly from your desktop. Built with efficiency in mind, LuxDim talks directly to your monitor using DDC/CI via the Windows API.
 
+<img width="112" height="275" alt="image" src="https://github.com/user-attachments/assets/e5ff76ea-7c8b-4c55-b9e1-7d106263df37" />
+<img width="149" height="111" alt="image" src="https://github.com/user-attachments/assets/d8f342b7-dc01-464a-a915-4b09359b4d58" />
+<img width="287" height="128" alt="image" src="https://github.com/user-attachments/assets/52d74140-9c8d-49e1-99d1-d0fce2cee979" />
+
+
+
+
 ## Features
+- **Tray:** Utility works in tray.
 - **Hotkeys:** You can configure your own hotkeys to change brightness.
 - **Ultra-lightweight:** The executable is under 300 KB.
 - **Stand-alone:** No external dependencies required (Static linking).
