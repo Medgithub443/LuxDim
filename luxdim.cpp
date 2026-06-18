@@ -1,6 +1,15 @@
 /*
- * LuxDim 1.1-beta - DDC/CI Brightness Tray Controller
- * Changelog 1.1: hotkey settings window (right-click -> Settings)
+ * LuxDim 1.2 - DDC/CI Brightness Tray Controller
+ *
+ * Changelog 1.2:
+ *   - Right-click tray menu: added "Restart"
+ *   - Settings: autostart on/off toggle
+ *   - Hotkeys saved to registry (HKCU\Software\LuxDim) — persist across restarts
+ *   - Fixed default Ctrl+Up / Ctrl+Down not working:
+ *       root cause was Hotkeys_Register() being called from WM_CREATE while
+ *       g_hwndMain was still nullptr, causing RegisterHotKey(NULL,...) whose
+ *       WM_HOTKEY messages DispatchMessage silently drops. Fixed by moving
+ *       Hotkeys_Load() + Hotkeys_Register() to WinMain after CreateWindowW returns.
  *
  * Build (portable, static):
  *   g++ -O2 -mwindows -static -static-libgcc -static-libstdc++ \
@@ -25,34 +34,43 @@ using std::max;
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-#define WM_TRAY         (WM_USER + 1)
-#define IDI_TRAY        1
-#define ID_EXIT         1001
-#define ID_SLIDER       1002
-#define TIMER_REFRESH   1003
-#define ID_SETTINGS     1004
+#define WM_TRAY             (WM_USER + 1)
+#define IDI_TRAY            1
+#define ID_EXIT             1001
+#define ID_SLIDER           1002
+#define TIMER_REFRESH       1003
+#define ID_SETTINGS         1004
+#define ID_RESTART          1005
 
-#define ID_HK_UP_BOX    2001
-#define ID_HK_DN_BOX    2002
-#define ID_BTN_SAVE     2003
-#define ID_BTN_CANCEL   2004
-#define ID_BTN_CLEAR_UP 2005
-#define ID_BTN_CLEAR_DN 2006
+#define ID_HK_UP_BOX        2001
+#define ID_HK_DN_BOX        2002
+#define ID_BTN_SAVE         2003
+#define ID_BTN_CANCEL       2004
+#define ID_BTN_CLEAR_UP     2005
+#define ID_BTN_CLEAR_DN     2006
+#define ID_AUTOSTART_CHECK  2007
 
-#define HOTKEY_UP       1
-#define HOTKEY_DOWN     2
+#define HOTKEY_UP           1
+#define HOTKEY_DOWN         2
 
-#define POPUP_W         90
-#define POPUP_H         220
-#define STEP            5
+#define POPUP_W             90
+#define POPUP_H             220
+#define STEP                5
+
+// ---------------------------------------------------------------------------
+// Registry paths
+// ---------------------------------------------------------------------------
+static const wchar_t* REG_APP_KEY  = L"Software\\LuxDim";
+static const wchar_t* REG_RUN_KEY  = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+static const wchar_t* REG_RUN_NAME = L"LuxDim";
 
 // ---------------------------------------------------------------------------
 // Hotkey state
 // ---------------------------------------------------------------------------
 struct HotkeyDef { UINT mod; UINT vk; };
 
-static HotkeyDef g_hkUp = {MOD_CONTROL, VK_UP};
-static HotkeyDef g_hkDn = {MOD_CONTROL, VK_DOWN};
+static HotkeyDef g_hkUp = { MOD_CONTROL, VK_UP   };
+static HotkeyDef g_hkDn = { MOD_CONTROL, VK_DOWN };
 
 // ---------------------------------------------------------------------------
 // Globals
@@ -69,6 +87,65 @@ static bool           g_popupVisible = false;
 static PHYSICAL_MONITOR* g_monitors  = nullptr;
 static DWORD             g_monCount  = 0;
 static int               g_brightness= 50;
+
+// ---------------------------------------------------------------------------
+// Registry: hotkeys persistence
+// ---------------------------------------------------------------------------
+void Hotkeys_Save()
+{
+    HKEY hk;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, REG_APP_KEY, 0, nullptr, 0,
+                        KEY_WRITE, nullptr, &hk, nullptr) != ERROR_SUCCESS) return;
+    DWORD v;
+    v = g_hkUp.mod; RegSetValueExW(hk, L"HkUpMod", 0, REG_DWORD, (BYTE*)&v, sizeof(v));
+    v = g_hkUp.vk;  RegSetValueExW(hk, L"HkUpVk",  0, REG_DWORD, (BYTE*)&v, sizeof(v));
+    v = g_hkDn.mod; RegSetValueExW(hk, L"HkDnMod", 0, REG_DWORD, (BYTE*)&v, sizeof(v));
+    v = g_hkDn.vk;  RegSetValueExW(hk, L"HkDnVk",  0, REG_DWORD, (BYTE*)&v, sizeof(v));
+    RegCloseKey(hk);
+}
+
+void Hotkeys_Load()
+{
+    HKEY hk;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_APP_KEY, 0, KEY_READ, &hk) != ERROR_SUCCESS) return;
+    DWORD v, sz;
+    sz = sizeof(DWORD);
+    if (RegQueryValueExW(hk, L"HkUpMod", nullptr, nullptr, (BYTE*)&v, &sz) == ERROR_SUCCESS) g_hkUp.mod = v;
+    sz = sizeof(DWORD);
+    if (RegQueryValueExW(hk, L"HkUpVk",  nullptr, nullptr, (BYTE*)&v, &sz) == ERROR_SUCCESS) g_hkUp.vk  = v;
+    sz = sizeof(DWORD);
+    if (RegQueryValueExW(hk, L"HkDnMod", nullptr, nullptr, (BYTE*)&v, &sz) == ERROR_SUCCESS) g_hkDn.mod = v;
+    sz = sizeof(DWORD);
+    if (RegQueryValueExW(hk, L"HkDnVk",  nullptr, nullptr, (BYTE*)&v, &sz) == ERROR_SUCCESS) g_hkDn.vk  = v;
+    RegCloseKey(hk);
+}
+
+// ---------------------------------------------------------------------------
+// Registry: autostart (HKCU Run key)
+// ---------------------------------------------------------------------------
+bool Autostart_Get()
+{
+    HKEY hk;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_RUN_KEY, 0, KEY_READ, &hk) != ERROR_SUCCESS) return false;
+    bool r = (RegQueryValueExW(hk, REG_RUN_NAME, nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS);
+    RegCloseKey(hk);
+    return r;
+}
+
+void Autostart_Set(bool enable)
+{
+    HKEY hk;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_RUN_KEY, 0, KEY_WRITE, &hk) != ERROR_SUCCESS) return;
+    if (enable) {
+        wchar_t path[MAX_PATH], val[MAX_PATH + 4];
+        GetModuleFileNameW(nullptr, path, MAX_PATH);
+        wsprintfW(val, L"\"%s\"", path);
+        RegSetValueExW(hk, REG_RUN_NAME, 0, REG_SZ, (BYTE*)val, (lstrlenW(val) + 1) * sizeof(wchar_t));
+    } else {
+        RegDeleteValueW(hk, REG_RUN_NAME);
+    }
+    RegCloseKey(hk);
+}
 
 // ---------------------------------------------------------------------------
 // DDC/CI
@@ -102,7 +179,7 @@ int DDC_GetBrightness()
 {
     for (DWORD i = 0; i < g_monCount; i++) {
         DWORD minB=0, curB=0, maxB=0;
-        if (GetMonitorBrightness(g_monitors[i].hPhysicalMonitor, &minB, &curB, &maxB) && maxB>0)
+        if (GetMonitorBrightness(g_monitors[i].hPhysicalMonitor, &minB, &curB, &maxB) && maxB > 0)
             return (int)(100.0*(curB-minB)/(maxB-minB)+0.5);
     }
     return g_brightness;
@@ -113,7 +190,7 @@ void DDC_SetBrightness(int pct)
     pct = max(0, min(100, pct));
     for (DWORD i = 0; i < g_monCount; i++) {
         DWORD minB=0, curB=0, maxB=0;
-        if (GetMonitorBrightness(g_monitors[i].hPhysicalMonitor, &minB, &curB, &maxB) && maxB>0) {
+        if (GetMonitorBrightness(g_monitors[i].hPhysicalMonitor, &minB, &curB, &maxB) && maxB > 0) {
             DWORD val = minB + (DWORD)((maxB-minB)*pct/100.0+0.5);
             SetMonitorBrightness(g_monitors[i].hPhysicalMonitor, val);
         }
@@ -122,6 +199,7 @@ void DDC_SetBrightness(int pct)
 
 // ---------------------------------------------------------------------------
 // Hotkey registration
+// NOTE: must only be called after g_hwndMain is set (i.e. from WinMain, not WM_CREATE)
 // ---------------------------------------------------------------------------
 void Hotkeys_Unregister()
 {
@@ -244,7 +322,7 @@ void HidePopup() { ShowWindow(g_hwndPopup, SW_HIDE); g_popupVisible = false; }
 LRESULT CALLBACK PopupProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
-    case WM_ACTIVATE:      if (LOWORD(wp)==WA_INACTIVE) HidePopup(); break;
+    case WM_ACTIVATE:       if (LOWORD(wp)==WA_INACTIVE) HidePopup(); break;
     case WM_CTLCOLORSTATIC: {
         HDC hdc=(HDC)wp; SetTextColor(hdc,RGB(255,220,80)); SetBkColor(hdc,RGB(24,24,28));
         return (LRESULT)CreateSolidBrush(RGB(24,24,28));
@@ -324,105 +402,122 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
     case WM_CREATE: {
-        // Up row
-        CreateWindowW(L"STATIC",L"Brightness Up:",WS_CHILD|WS_VISIBLE|SS_LEFT,
-            16,18,130,16,hwnd,nullptr,g_hInst,nullptr);
-        HWND eUp=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"",
+        // --- Brightness Up ---
+        CreateWindowW(L"STATIC", L"Brightness Up:", WS_CHILD|WS_VISIBLE|SS_LEFT,
+            16, 18, 130, 16, hwnd, nullptr, g_hInst, nullptr);
+        HWND eUp = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
             WS_CHILD|WS_VISIBLE|ES_READONLY,
-            16,36,182,22,hwnd,(HMENU)ID_HK_UP_BOX,g_hInst,nullptr);
-        CreateWindowW(L"BUTTON",L"x",WS_CHILD|WS_VISIBLE,
-            202,36,26,22,hwnd,(HMENU)ID_BTN_CLEAR_UP,g_hInst,nullptr);
-        // Down row
-        CreateWindowW(L"STATIC",L"Brightness Down:",WS_CHILD|WS_VISIBLE|SS_LEFT,
-            16,70,130,16,hwnd,nullptr,g_hInst,nullptr);
-        HWND eDn=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"",
-            WS_CHILD|WS_VISIBLE|ES_READONLY,
-            16,88,182,22,hwnd,(HMENU)ID_HK_DN_BOX,g_hInst,nullptr);
-        CreateWindowW(L"BUTTON",L"x",WS_CHILD|WS_VISIBLE,
-            202,88,26,22,hwnd,(HMENU)ID_BTN_CLEAR_DN,g_hInst,nullptr);
-        // Save / Cancel
-        CreateWindowW(L"BUTTON",L"Save",WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON,
-            36,124,82,26,hwnd,(HMENU)ID_BTN_SAVE,g_hInst,nullptr);
-        CreateWindowW(L"BUTTON",L"Cancel",WS_CHILD|WS_VISIBLE,
-            126,124,82,26,hwnd,(HMENU)ID_BTN_CANCEL,g_hInst,nullptr);
+            16, 36, 182, 22, hwnd, (HMENU)ID_HK_UP_BOX, g_hInst, nullptr);
+        CreateWindowW(L"BUTTON", L"x", WS_CHILD|WS_VISIBLE,
+            202, 36, 26, 22, hwnd, (HMENU)ID_BTN_CLEAR_UP, g_hInst, nullptr);
 
-        // Init from current
-        g_capUp.current=g_hkUp; g_capDn.current=g_hkDn;
+        // --- Brightness Down ---
+        CreateWindowW(L"STATIC", L"Brightness Down:", WS_CHILD|WS_VISIBLE|SS_LEFT,
+            16, 70, 130, 16, hwnd, nullptr, g_hInst, nullptr);
+        HWND eDn = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+            WS_CHILD|WS_VISIBLE|ES_READONLY,
+            16, 88, 182, 22, hwnd, (HMENU)ID_HK_DN_BOX, g_hInst, nullptr);
+        CreateWindowW(L"BUTTON", L"x", WS_CHILD|WS_VISIBLE,
+            202, 88, 26, 22, hwnd, (HMENU)ID_BTN_CLEAR_DN, g_hInst, nullptr);
+
+        // --- Autostart toggle ---
+        HWND chkAuto = CreateWindowW(L"BUTTON", L"Launch at Windows startup",
+            WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,
+            16, 122, 214, 20, hwnd, (HMENU)ID_AUTOSTART_CHECK, g_hInst, nullptr);
+        SendMessageW(chkAuto, BM_SETCHECK,
+                     Autostart_Get() ? BST_CHECKED : BST_UNCHECKED, 0);
+
+        // --- Save / Cancel ---
+        CreateWindowW(L"BUTTON", L"Save", WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON,
+            36, 154, 82, 26, hwnd, (HMENU)ID_BTN_SAVE, g_hInst, nullptr);
+        CreateWindowW(L"BUTTON", L"Cancel", WS_CHILD|WS_VISIBLE,
+            126, 154, 82, 26, hwnd, (HMENU)ID_BTN_CANCEL, g_hInst, nullptr);
+
+        // Init hotkey fields from current state
+        g_capUp.current = g_hkUp; g_capDn.current = g_hkDn;
         wchar_t buf[128];
-        FormatHotkey(g_hkUp,buf,128); SetWindowTextW(eUp,buf);
-        FormatHotkey(g_hkDn,buf,128); SetWindowTextW(eDn,buf);
+        FormatHotkey(g_hkUp, buf, 128); SetWindowTextW(eUp, buf);
+        FormatHotkey(g_hkDn, buf, 128); SetWindowTextW(eDn, buf);
 
-        g_capUp.origProc=(WNDPROC)SetWindowLongPtrW(eUp,GWLP_WNDPROC,(LONG_PTR)HkEditProc);
-        g_capDn.origProc=(WNDPROC)SetWindowLongPtrW(eDn,GWLP_WNDPROC,(LONG_PTR)HkEditProc);
+        g_capUp.origProc = (WNDPROC)SetWindowLongPtrW(eUp, GWLP_WNDPROC, (LONG_PTR)HkEditProc);
+        g_capDn.origProc = (WNDPROC)SetWindowLongPtrW(eDn, GWLP_WNDPROC, (LONG_PTR)HkEditProc);
 
         // Apply font to all children
-        HFONT hf=CreateFontW(14,0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
-        EnumChildWindows(hwnd,[](HWND child,LPARAM lp)->BOOL{
-            SendMessage(child,WM_SETFONT,lp,TRUE); return TRUE;
-        },(LPARAM)hf);
+        HFONT hf = CreateFontW(14,0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
+        EnumChildWindows(hwnd, [](HWND child, LPARAM lp) -> BOOL {
+            SendMessage(child, WM_SETFONT, lp, TRUE); return TRUE;
+        }, (LPARAM)hf);
         break;
     }
     case WM_CTLCOLORSTATIC:
     case WM_CTLCOLOREDIT: {
-        HDC hdc=(HDC)wp;
-        SetTextColor(hdc,RGB(220,220,220)); SetBkColor(hdc,RGB(30,30,36));
+        HDC hdc = (HDC)wp;
+        SetTextColor(hdc, RGB(220,220,220)); SetBkColor(hdc, RGB(30,30,36));
         return (LRESULT)CreateSolidBrush(RGB(30,30,36));
     }
     case WM_CTLCOLORBTN: {
-        HDC hdc=(HDC)wp;
-        SetTextColor(hdc,RGB(220,220,220)); SetBkColor(hdc,RGB(44,44,52));
+        HDC hdc = (HDC)wp;
+        SetTextColor(hdc, RGB(220,220,220)); SetBkColor(hdc, RGB(44,44,52));
         return (LRESULT)CreateSolidBrush(RGB(44,44,52));
     }
     case WM_COMMAND:
-        switch(LOWORD(wp)) {
+        switch (LOWORD(wp)) {
         case ID_BTN_CLEAR_UP:
-            g_capUp.current={0,0};
-            SetWindowTextW(GetDlgItem(hwnd,ID_HK_UP_BOX),L"(not set)"); break;
+            g_capUp.current = {0,0};
+            SetWindowTextW(GetDlgItem(hwnd, ID_HK_UP_BOX), L"(not set)"); break;
         case ID_BTN_CLEAR_DN:
-            g_capDn.current={0,0};
-            SetWindowTextW(GetDlgItem(hwnd,ID_HK_DN_BOX),L"(not set)"); break;
+            g_capDn.current = {0,0};
+            SetWindowTextW(GetDlgItem(hwnd, ID_HK_DN_BOX), L"(not set)"); break;
         case ID_BTN_SAVE:
-            g_hkUp=g_capUp.current; g_hkDn=g_capDn.current;
-            Hotkeys_Register(); DestroyWindow(hwnd); break;
+            g_hkUp = g_capUp.current;
+            g_hkDn = g_capDn.current;
+            Hotkeys_Save();     // persist to registry
+            Hotkeys_Register();
+            Autostart_Set(
+                SendMessageW(GetDlgItem(hwnd, ID_AUTOSTART_CHECK), BM_GETCHECK, 0, 0) == BST_CHECKED
+            );
+            DestroyWindow(hwnd);
+            break;
         case ID_BTN_CANCEL:
             DestroyWindow(hwnd); break;
         }
         break;
     case WM_PAINT: {
-        PAINTSTRUCT ps; HDC hdc=BeginPaint(hwnd,&ps);
-        RECT rc; GetClientRect(hwnd,&rc);
-        HBRUSH bg=CreateSolidBrush(RGB(24,24,30));
-        FillRect(hdc,&rc,bg); DeleteObject(bg);
-        EndPaint(hwnd,&ps); break;
+        PAINTSTRUCT ps; HDC hdc = BeginPaint(hwnd, &ps);
+        RECT rc; GetClientRect(hwnd, &rc);
+        HBRUSH bg = CreateSolidBrush(RGB(24,24,30));
+        FillRect(hdc, &rc, bg); DeleteObject(bg);
+        EndPaint(hwnd, &ps); break;
     }
     case WM_ERASEBKGND: return 1;
-    case WM_DESTROY: g_hwndSettings=nullptr; break;
+    case WM_DESTROY: g_hwndSettings = nullptr; break;
     }
-    return DefWindowProc(hwnd,msg,wp,lp);
+    return DefWindowProc(hwnd, msg, wp, lp);
 }
 
 void ShowSettings()
 {
     if (g_hwndSettings) { SetForegroundWindow(g_hwndSettings); return; }
 
-    static bool reg=false;
+    static bool reg = false;
     if (!reg) {
-        WNDCLASSW wcs={};
-        wcs.lpfnWndProc=SettingsProc; wcs.hInstance=g_hInst;
-        wcs.hbrBackground=CreateSolidBrush(RGB(24,24,30));
-        wcs.lpszClassName=L"LuxDimSettings";
-        wcs.hCursor=LoadCursor(nullptr,IDC_ARROW);
-        RegisterClassW(&wcs); reg=true;
+        WNDCLASSW wcs = {};
+        wcs.lpfnWndProc   = SettingsProc;
+        wcs.hInstance     = g_hInst;
+        wcs.hbrBackground = CreateSolidBrush(RGB(24,24,30));
+        wcs.lpszClassName = L"LuxDimSettings";
+        wcs.hCursor       = LoadCursor(nullptr, IDC_ARROW);
+        RegisterClassW(&wcs); reg = true;
     }
 
-    int W=246, H=166;
-    int sx=GetSystemMetrics(SM_CXSCREEN), sy=GetSystemMetrics(SM_CYSCREEN);
-    g_hwndSettings=CreateWindowExW(WS_EX_TOOLWINDOW,
-        L"LuxDimSettings", L"LuxDim - Hotkey Settings",
+    int W = 246, H = 196;
+    int sx = GetSystemMetrics(SM_CXSCREEN), sy = GetSystemMetrics(SM_CYSCREEN);
+    g_hwndSettings = CreateWindowExW(WS_EX_TOOLWINDOW,
+        L"LuxDimSettings", L"LuxDim - Settings",
         WS_POPUP|WS_CAPTION|WS_SYSMENU|WS_CLIPCHILDREN,
-        (sx-W)/2,(sy-H)/2,W,H,
-        g_hwndMain,nullptr,g_hInst,nullptr);
-    ShowWindow(g_hwndSettings,SW_SHOW);
+        (sx-W)/2, (sy-H)/2, W, H,
+        g_hwndMain, nullptr, g_hInst, nullptr);
+    ShowWindow(g_hwndSettings, SW_SHOW);
     SetForegroundWindow(g_hwndSettings);
 }
 
@@ -434,60 +529,72 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     switch (msg) {
     case WM_CREATE:
         Tray_Add(hwnd);
-        Hotkeys_Register();
+        // Hotkeys are registered in WinMain AFTER g_hwndMain is assigned,
+        // so RegisterHotKey receives a valid HWND and WM_HOTKEY is dispatched correctly.
         SetTimer(hwnd, TIMER_REFRESH, 5000, nullptr);
         break;
 
     case WM_HOTKEY:
-        if (wp==HOTKEY_UP) {
-            g_brightness=min(100,g_brightness+STEP);
-        } else if (wp==HOTKEY_DOWN) {
-            g_brightness=max(0,g_brightness-STEP);
+        if (wp == HOTKEY_UP) {
+            g_brightness = min(100, g_brightness + STEP);
+        } else if (wp == HOTKEY_DOWN) {
+            g_brightness = max(0, g_brightness - STEP);
         } else break;
         DDC_SetBrightness(g_brightness);
-        if (g_popupVisible) { SendMessage(g_hwndSlider,TBM_SETPOS,TRUE,100-g_brightness); UpdateLabel(); }
+        if (g_popupVisible) { SendMessage(g_hwndSlider, TBM_SETPOS, TRUE, 100-g_brightness); UpdateLabel(); }
         Tray_Update();
         break;
 
     case WM_TIMER:
-        if (wp==TIMER_REFRESH&&!g_popupVisible) {
-            int read=DDC_GetBrightness();
-            if (read!=g_brightness) { g_brightness=read; Tray_Update(); }
+        if (wp == TIMER_REFRESH && !g_popupVisible) {
+            int read = DDC_GetBrightness();
+            if (read != g_brightness) { g_brightness = read; Tray_Update(); }
         }
         break;
 
     case WM_TRAY:
-        switch(LOWORD(lp)) {
+        switch (LOWORD(lp)) {
         case WM_LBUTTONUP:
-            if (g_popupVisible) HidePopup(); else ShowPopup(); break;
+            if (g_popupVisible) HidePopup(); else ShowPopup();
+            break;
         case WM_RBUTTONUP: {
             POINT pt; GetCursorPos(&pt);
-            HMENU menu=CreatePopupMenu();
-            AppendMenuW(menu,MF_STRING,ID_SETTINGS,L"Settings");
-            AppendMenuW(menu,MF_SEPARATOR,0,nullptr);
-            AppendMenuW(menu,MF_STRING,ID_EXIT,L"Exit");
+            HMENU menu = CreatePopupMenu();
+            AppendMenuW(menu, MF_STRING,    ID_SETTINGS, L"Settings");
+            AppendMenuW(menu, MF_STRING,    ID_RESTART,  L"Restart");
+            AppendMenuW(menu, MF_SEPARATOR, 0,           nullptr);
+            AppendMenuW(menu, MF_STRING,    ID_EXIT,     L"Exit");
             SetForegroundWindow(hwnd);
-            TrackPopupMenu(menu,TPM_RIGHTBUTTON,pt.x,pt.y,0,hwnd,nullptr);
-            DestroyMenu(menu); break;
+            TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, nullptr);
+            DestroyMenu(menu);
+            break;
         }
         }
         break;
 
     case WM_COMMAND:
-        if      (LOWORD(wp)==ID_SETTINGS) ShowSettings();
-        else if (LOWORD(wp)==ID_EXIT)     DestroyWindow(hwnd);
+        if (LOWORD(wp) == ID_SETTINGS) {
+            ShowSettings();
+        } else if (LOWORD(wp) == ID_RESTART) {
+            wchar_t path[MAX_PATH];
+            GetModuleFileNameW(nullptr, path, MAX_PATH);
+            ShellExecuteW(nullptr, L"open", path, nullptr, nullptr, SW_SHOW);
+            DestroyWindow(hwnd);
+        } else if (LOWORD(wp) == ID_EXIT) {
+            DestroyWindow(hwnd);
+        }
         break;
 
     case WM_DESTROY:
         Hotkeys_Unregister();
-        KillTimer(hwnd,TIMER_REFRESH);
+        KillTimer(hwnd, TIMER_REFRESH);
         Tray_Remove();
-        if (g_monitors&&g_monCount) DestroyPhysicalMonitors(g_monCount,g_monitors);
+        if (g_monitors && g_monCount) DestroyPhysicalMonitors(g_monCount, g_monitors);
         delete[] g_monitors;
         PostQuitMessage(0);
         break;
     }
-    return DefWindowProc(hwnd,msg,wp,lp);
+    return DefWindowProc(hwnd, msg, wp, lp);
 }
 
 // ---------------------------------------------------------------------------
@@ -495,39 +602,52 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 // ---------------------------------------------------------------------------
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
 {
-    g_hInst=hInst;
-    INITCOMMONCONTROLSEX icx={sizeof(icx),ICC_BAR_CLASSES};
+    g_hInst = hInst;
+    INITCOMMONCONTROLSEX icx = { sizeof(icx), ICC_BAR_CLASSES };
     InitCommonControlsEx(&icx);
 
     DDC_EnumerateMonitors();
-    g_brightness=DDC_GetBrightness();
+    g_brightness = DDC_GetBrightness();
 
-    WNDCLASSW wc={};
-    wc.lpfnWndProc=MainProc; wc.hInstance=hInst; wc.lpszClassName=L"LuxDimMain";
+    WNDCLASSW wc = {};
+    wc.lpfnWndProc   = MainProc;
+    wc.hInstance     = hInst;
+    wc.lpszClassName = L"LuxDimMain";
     RegisterClassW(&wc);
-    g_hwndMain=CreateWindowW(L"LuxDimMain",L"LuxDim",WS_POPUP,0,0,0,0,nullptr,nullptr,hInst,nullptr);
 
-    WNDCLASSW wcp={};
-    wcp.lpfnWndProc=PopupProc; wcp.hInstance=hInst;
-    wcp.hbrBackground=CreateSolidBrush(RGB(24,24,28));
-    wcp.lpszClassName=L"LuxDimPopup";
+    g_hwndMain = CreateWindowW(L"LuxDimMain", L"LuxDim", WS_POPUP,
+                               0,0,0,0, nullptr,nullptr,hInst,nullptr);
+
+    // g_hwndMain is now valid. Load saved hotkeys from registry and register them.
+    // This is the correct place — calling RegisterHotKey with a null HWND (which
+    // happens if called from WM_CREATE before CreateWindowW returns) causes
+    // WM_HOTKEY to be posted with hwnd=NULL and DispatchMessage silently drops it.
+    Hotkeys_Load();
+    Hotkeys_Register();
+
+    WNDCLASSW wcp = {};
+    wcp.lpfnWndProc   = PopupProc;
+    wcp.hInstance     = hInst;
+    wcp.hbrBackground = CreateSolidBrush(RGB(24,24,28));
+    wcp.lpszClassName = L"LuxDimPopup";
     RegisterClassW(&wcp);
-    g_hwndPopup=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_TOPMOST,L"LuxDimPopup",nullptr,
-        WS_POPUP|WS_CLIPCHILDREN,0,0,POPUP_W,POPUP_H,g_hwndMain,nullptr,hInst,nullptr);
 
-    g_hwndSlider=CreateWindowExW(0,TRACKBAR_CLASSW,nullptr,
+    g_hwndPopup = CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_TOPMOST, L"LuxDimPopup", nullptr,
+        WS_POPUP|WS_CLIPCHILDREN, 0,0,POPUP_W,POPUP_H, g_hwndMain,nullptr,hInst,nullptr);
+
+    g_hwndSlider = CreateWindowExW(0, TRACKBAR_CLASSW, nullptr,
         WS_CHILD|WS_VISIBLE|TBS_VERT|TBS_NOTICKS|TBS_BOTH,
-        18,28,34,150,g_hwndPopup,(HMENU)ID_SLIDER,hInst,nullptr);
-    SendMessage(g_hwndSlider,TBM_SETRANGE,FALSE,MAKELPARAM(0,100));
-    SendMessage(g_hwndSlider,TBM_SETPOS,TRUE,100-g_brightness);
+        18,28,34,150, g_hwndPopup,(HMENU)ID_SLIDER,hInst,nullptr);
+    SendMessage(g_hwndSlider, TBM_SETRANGE, FALSE, MAKELPARAM(0,100));
+    SendMessage(g_hwndSlider, TBM_SETPOS,   TRUE,  100-g_brightness);
 
-    g_hwndLabel=CreateWindowExW(0,L"STATIC",L"50",WS_CHILD|WS_VISIBLE|SS_CENTER,
-        8,184,POPUP_W-16,22,g_hwndPopup,nullptr,hInst,nullptr);
-    HFONT hf=CreateFontW(18,0,0,0,FW_BOLD,0,0,0,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
-    SendMessage(g_hwndLabel,WM_SETFONT,(WPARAM)hf,TRUE);
+    g_hwndLabel = CreateWindowExW(0, L"STATIC", L"50", WS_CHILD|WS_VISIBLE|SS_CENTER,
+        8,184,POPUP_W-16,22, g_hwndPopup,nullptr,hInst,nullptr);
+    HFONT hf = CreateFontW(18,0,0,0,FW_BOLD,0,0,0,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
+    SendMessage(g_hwndLabel, WM_SETFONT, (WPARAM)hf, TRUE);
     UpdateLabel();
 
     MSG msg;
-    while (GetMessage(&msg,nullptr,0,0)) { TranslateMessage(&msg); DispatchMessage(&msg); }
+    while (GetMessage(&msg, nullptr, 0, 0)) { TranslateMessage(&msg); DispatchMessage(&msg); }
     return 0;
 }
