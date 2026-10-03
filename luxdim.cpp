@@ -1,15 +1,15 @@
 /*
- * LuxDim 1.2 - DDC/CI Brightness Tray Controller
+ * LuxDim 1.3 - DDC/CI Brightness Tray Controller
  *
- * Changelog 1.2:
- *   - Right-click tray menu: added "Restart"
- *   - Settings: autostart on/off toggle
- *   - Hotkeys saved to registry (HKCU\Software\LuxDim) — persist across restarts
- *   - Fixed default Ctrl+Up / Ctrl+Down not working:
- *       root cause was Hotkeys_Register() being called from WM_CREATE while
- *       g_hwndMain was still nullptr, causing RegisterHotKey(NULL,...) whose
- *       WM_HOTKEY messages DispatchMessage silently drops. Fixed by moving
- *       Hotkeys_Load() + Hotkeys_Register() to WinMain after CreateWindowW returns.
+ * Changelog 1.3:
+ *   - Settings window: Save/Cancel buttons no longer cut off — window size is
+ *     computed with AdjustWindowRect so the client area always fits controls
+ *   - Removed dynamic per-brightness tray icon recoloring; one static icon
+ *   - Popup slider is now centered horizontally in the popup window
+ *   - New OSD overlay: large light-blue brightness number in the top-right
+ *     corner on hotkey changes; transparent click-through window with fade-out
+ *   - Bilingual (RU/EN) Inno Setup installer with desktop icon and autostart
+ *     tasks; autostart is written to HKCU Run by the installer
  *
  * Build (portable, static):
  *   g++ -O2 -mwindows -static -static-libgcc -static-libstdc++ \
@@ -41,6 +41,7 @@ using std::max;
 #define TIMER_REFRESH       1003
 #define ID_SETTINGS         1004
 #define ID_RESTART          1005
+#define TIMER_OVERLAY       1006
 
 #define ID_HK_UP_BOX        2001
 #define ID_HK_DN_BOX        2002
@@ -55,6 +56,9 @@ using std::max;
 
 #define POPUP_W             90
 #define POPUP_H             220
+#define OVERLAY_W           380
+#define OVERLAY_H           240
+#define OVERLAY_MARGIN      40
 #define STEP                5
 
 // ---------------------------------------------------------------------------
@@ -80,6 +84,7 @@ static HWND           g_hwndPopup    = nullptr;
 static HWND           g_hwndSlider   = nullptr;
 static HWND           g_hwndLabel    = nullptr;
 static HWND           g_hwndSettings = nullptr;
+static HWND           g_hwndOverlay  = nullptr;
 static HINSTANCE      g_hInst        = nullptr;
 static NOTIFYICONDATA g_nid          = {};
 static bool           g_popupVisible = false;
@@ -87,6 +92,10 @@ static bool           g_popupVisible = false;
 static PHYSICAL_MONITOR* g_monitors  = nullptr;
 static DWORD             g_monCount  = 0;
 static int               g_brightness= 50;
+
+static HFONT g_overlayFont  = nullptr;
+static BYTE  g_overlayAlpha = 0;
+static int   g_overlayHold  = 0;
 
 // ---------------------------------------------------------------------------
 // Registry: hotkeys persistence
@@ -215,9 +224,9 @@ void Hotkeys_Register()
 }
 
 // ---------------------------------------------------------------------------
-// Icon (GDI, 16x16)
+// Icon (GDI, 16x16) — static, single color
 // ---------------------------------------------------------------------------
-HICON CreateSunIcon(int brightness)
+HICON CreateSunIcon()
 {
     int sz = 16;
     HDC hdc = GetDC(nullptr);
@@ -230,16 +239,13 @@ HICON CreateSunIcon(int brightness)
     RECT rc = {0,0,sz,sz};
     FillRect(mdc, &rc, bgBrush); DeleteObject(bgBrush);
 
-    int r  = min(180 + brightness*75/100, 255);
-    int g2 = min(120 + brightness*100/100, 255);
-
-    HBRUSH sunBrush = CreateSolidBrush(RGB(r,g2,0));
+    HBRUSH sunBrush = CreateSolidBrush(RGB(255,220,0));
     SelectObject(mdc, sunBrush);
     SelectObject(mdc, GetStockObject(NULL_PEN));
     Ellipse(mdc, 4, 4, 12, 12);
     DeleteObject(sunBrush);
 
-    HPEN pen = CreatePen(PS_SOLID, 1, RGB(r, min(g2,220), 0));
+    HPEN pen = CreatePen(PS_SOLID, 1, RGB(255,220,0));
     SelectObject(mdc, pen);
     int cx=8, cy=8;
     int rays[8][4] = {
@@ -276,17 +282,14 @@ void Tray_Update()
 {
     wchar_t tip[64]; wsprintfW(tip, L"LuxDim  %d%%", g_brightness);
     lstrcpynW(g_nid.szTip, tip, 64);
-    HICON old = g_nid.hIcon;
-    g_nid.hIcon = CreateSunIcon(g_brightness);
     Shell_NotifyIconW(NIM_MODIFY, &g_nid);
-    if (old) DestroyIcon(old);
 }
 
 void Tray_Add(HWND hwnd)
 {
     g_nid.cbSize=sizeof(g_nid); g_nid.hWnd=hwnd; g_nid.uID=IDI_TRAY;
     g_nid.uFlags=NIF_ICON|NIF_TIP|NIF_MESSAGE; g_nid.uCallbackMessage=WM_TRAY;
-    g_nid.hIcon=CreateSunIcon(g_brightness);
+    g_nid.hIcon=CreateSunIcon();
     lstrcpyW(g_nid.szTip, L"LuxDim");
     Shell_NotifyIconW(NIM_ADD, &g_nid);
 }
@@ -348,6 +351,59 @@ LRESULT CALLBACK PopupProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_ERASEBKGND: return 1;
     }
     return DefWindowProc(hwnd,msg,wp,lp);
+}
+
+// ---------------------------------------------------------------------------
+// OSD overlay (top-right, shown on hotkey changes, click-through, fade-out)
+// ---------------------------------------------------------------------------
+void Overlay_Show()
+{
+    if (!g_hwndOverlay) return;
+    RECT wa; SystemParametersInfo(SPI_GETWORKAREA, 0, &wa, 0);
+    SetWindowPos(g_hwndOverlay, HWND_TOPMOST,
+        wa.right-OVERLAY_W-OVERLAY_MARGIN, wa.top+OVERLAY_MARGIN,
+        OVERLAY_W, OVERLAY_H, SWP_SHOWWINDOW|SWP_NOACTIVATE);
+    g_overlayAlpha = 255;
+    g_overlayHold  = 0;
+    SetLayeredWindowAttributes(g_hwndOverlay, RGB(0,0,0), 255, LWA_COLORKEY|LWA_ALPHA);
+    InvalidateRect(g_hwndOverlay, nullptr, TRUE);
+    UpdateWindow(g_hwndOverlay);
+    SetTimer(g_hwndMain, TIMER_OVERLAY, 30, nullptr);
+}
+
+void Overlay_FadeStep()
+{
+    if (g_overlayHold < 25) { g_overlayHold++; return; }   // ~750 ms hold
+    if (g_overlayAlpha <= 6) {
+        KillTimer(g_hwndMain, TIMER_OVERLAY);
+        ShowWindow(g_hwndOverlay, SW_HIDE);
+        return;
+    }
+    g_overlayAlpha -= 6;
+    SetLayeredWindowAttributes(g_hwndOverlay, RGB(0,0,0), g_overlayAlpha, LWA_COLORKEY|LWA_ALPHA);
+}
+
+LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg) {
+    case WM_ERASEBKGND: {
+        RECT rc; GetClientRect(hwnd, &rc);
+        FillRect((HDC)wp, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
+        return 1;
+    }
+    case WM_PAINT: {
+        PAINTSTRUCT ps; HDC hdc = BeginPaint(hwnd, &ps);
+        SetTextColor(hdc, RGB(150,195,255));
+        SetBkMode(hdc, TRANSPARENT);
+        SelectObject(hdc, g_overlayFont);
+        wchar_t buf[8]; wsprintfW(buf, L"%d", g_brightness);
+        RECT rc; GetClientRect(hwnd, &rc);
+        DrawTextW(hdc, buf, -1, &rc, DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+        EndPaint(hwnd, &ps);
+        break;
+    }
+    }
+    return DefWindowProc(hwnd, msg, wp, lp);
 }
 
 // ---------------------------------------------------------------------------
@@ -453,12 +509,14 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_CTLCOLOREDIT: {
         HDC hdc = (HDC)wp;
         SetTextColor(hdc, RGB(220,220,220)); SetBkColor(hdc, RGB(30,30,36));
-        return (LRESULT)CreateSolidBrush(RGB(30,30,36));
+        static HBRUSH bgBrush = CreateSolidBrush(RGB(30,30,36));
+        return (LRESULT)bgBrush;
     }
     case WM_CTLCOLORBTN: {
         HDC hdc = (HDC)wp;
         SetTextColor(hdc, RGB(220,220,220)); SetBkColor(hdc, RGB(44,44,52));
-        return (LRESULT)CreateSolidBrush(RGB(44,44,52));
+        static HBRUSH btnBrush = CreateSolidBrush(RGB(44,44,52));
+        return (LRESULT)btnBrush;
     }
     case WM_COMMAND:
         switch (LOWORD(wp)) {
@@ -510,12 +568,18 @@ void ShowSettings()
         RegisterClassW(&wcs); reg = true;
     }
 
-    int W = 246, H = 196;
+    // Window size is derived from the desired client area so that
+    // no control is clipped by the caption/borders.
+    int clientW = 246, clientH = 196;
+    DWORD style = WS_POPUP|WS_CAPTION|WS_SYSMENU;
+    RECT rc = {0, 0, clientW, clientH};
+    AdjustWindowRect(&rc, style, FALSE);
+    int winW = rc.right - rc.left, winH = rc.bottom - rc.top;
     int sx = GetSystemMetrics(SM_CXSCREEN), sy = GetSystemMetrics(SM_CYSCREEN);
     g_hwndSettings = CreateWindowExW(WS_EX_TOOLWINDOW,
         L"LuxDimSettings", L"LuxDim - Settings",
-        WS_POPUP|WS_CAPTION|WS_SYSMENU|WS_CLIPCHILDREN,
-        (sx-W)/2, (sy-H)/2, W, H,
+        style,
+        (sx-winW)/2, (sy-winH)/2, winW, winH,
         g_hwndMain, nullptr, g_hInst, nullptr);
     ShowWindow(g_hwndSettings, SW_SHOW);
     SetForegroundWindow(g_hwndSettings);
@@ -543,12 +607,15 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         DDC_SetBrightness(g_brightness);
         if (g_popupVisible) { SendMessage(g_hwndSlider, TBM_SETPOS, TRUE, 100-g_brightness); UpdateLabel(); }
         Tray_Update();
+        Overlay_Show();
         break;
 
     case WM_TIMER:
         if (wp == TIMER_REFRESH && !g_popupVisible) {
             int read = DDC_GetBrightness();
             if (read != g_brightness) { g_brightness = read; Tray_Update(); }
+        } else if (wp == TIMER_OVERLAY) {
+            Overlay_FadeStep();
         }
         break;
 
@@ -588,7 +655,9 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_DESTROY:
         Hotkeys_Unregister();
         KillTimer(hwnd, TIMER_REFRESH);
+        KillTimer(hwnd, TIMER_OVERLAY);
         Tray_Remove();
+        if (g_overlayFont) DeleteObject(g_overlayFont);
         if (g_monitors && g_monCount) DestroyPhysicalMonitors(g_monCount, g_monitors);
         delete[] g_monitors;
         PostQuitMessage(0);
@@ -637,7 +706,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
 
     g_hwndSlider = CreateWindowExW(0, TRACKBAR_CLASSW, nullptr,
         WS_CHILD|WS_VISIBLE|TBS_VERT|TBS_NOTICKS|TBS_BOTH,
-        18,28,34,150, g_hwndPopup,(HMENU)ID_SLIDER,hInst,nullptr);
+        (POPUP_W-34)/2,28,34,150, g_hwndPopup,(HMENU)ID_SLIDER,hInst,nullptr);
     SendMessage(g_hwndSlider, TBM_SETRANGE, FALSE, MAKELPARAM(0,100));
     SendMessage(g_hwndSlider, TBM_SETPOS,   TRUE,  100-g_brightness);
 
@@ -646,6 +715,23 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     HFONT hf = CreateFontW(18,0,0,0,FW_BOLD,0,0,0,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
     SendMessage(g_hwndLabel, WM_SETFONT, (WPARAM)hf, TRUE);
     UpdateLabel();
+
+    WNDCLASSW wco = {};
+    wco.lpfnWndProc   = OverlayProc;
+    wco.hInstance     = hInst;
+    wco.lpszClassName = L"LuxDimOverlay";
+    RegisterClassW(&wco);
+
+    g_hwndOverlay = CreateWindowExW(
+        WS_EX_LAYERED|WS_EX_TRANSPARENT|WS_EX_NOACTIVATE|WS_EX_TOPMOST|WS_EX_TOOLWINDOW,
+        L"LuxDimOverlay", nullptr, WS_POPUP,
+        0,0,OVERLAY_W,OVERLAY_H, g_hwndMain,nullptr,hInst,nullptr);
+    SetLayeredWindowAttributes(g_hwndOverlay, RGB(0,0,0), 0, LWA_COLORKEY|LWA_ALPHA);
+
+    HDC sdc = GetDC(nullptr);
+    g_overlayFont = CreateFontW(-MulDiv(130, GetDeviceCaps(sdc, LOGPIXELSY), 72),
+        0,0,0,FW_BOLD,0,0,0,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
+    ReleaseDC(nullptr, sdc);
 
     MSG msg;
     while (GetMessage(&msg, nullptr, 0, 0)) { TranslateMessage(&msg); DispatchMessage(&msg); }
